@@ -1,7 +1,13 @@
 import { assert, describe, it } from 'vitest';
 import type { IDataObject } from 'n8n-workflow';
 import { Sendly } from '../nodes/Sendly/Sendly.node';
-import { executeContext, locator, MockHttp, rejection } from './helpers';
+import {
+	executeContext,
+	locator,
+	MockHttp,
+	rejection,
+	type ExecutionPosition,
+} from './helpers';
 
 const node = new Sendly();
 const TEMPLATE_ID = '5d6e7f80-9a1b-4c2d-8e3f-405162738495';
@@ -19,8 +25,21 @@ function sendParams(overrides: IDataObject = {}): IDataObject {
 	};
 }
 
-async function run(params: IDataObject[], http: MockHttp, continueOnFail = false) {
-	return await node.execute.call(executeContext(params, http, { continueOnFail }));
+async function run(
+	params: IDataObject[],
+	http: MockHttp,
+	continueOnFail = false,
+	position?: ExecutionPosition,
+) {
+	return await node.execute.call(executeContext(params, http, { continueOnFail, position }));
+}
+
+function keys(http: MockHttp): string[] {
+	return http.calls.map((call) => String(call.headers['Idempotency-Key']));
+}
+
+function receipts(count: number) {
+	return Array.from({ length: count }, () => ({ statusCode: 202, body: RECEIPT }));
 }
 
 describe('Email > Send', () => {
@@ -37,15 +56,48 @@ describe('Email > Send', () => {
 		assert.deepEqual(call.body, { to: 'ada@example.com', template: TEMPLATE_ID });
 	});
 
-	it('sends a fresh Idempotency-Key on every execution when no Deduplication Key is set', async () => {
-		const http = new MockHttp([
-			{ statusCode: 202, body: RECEIPT },
-			{ statusCode: 202, body: RECEIPT },
-		]);
+	it('derives a distinct Idempotency-Key per item from the execution when no Deduplication Key is set', async () => {
+		const http = new MockHttp(receipts(2));
 		await run([sendParams(), sendParams()], http);
-		const [first, second] = http.calls.map((call) => String(call.headers['Idempotency-Key']));
+		const [first, second] = keys(http);
+		assert.match(first, /^n8n-run:[0-9a-f]{64}$/);
+		assert.match(second, /^n8n-run:[0-9a-f]{64}$/);
+		assert.notStrictEqual(first, second);
+	});
+
+	it('keeps every item key when the node is re-run in the same execution (Retry On Fail), so sent items are replayed, not resent', async () => {
+		const items = [sendParams(), sendParams(), sendParams()];
+		const firstTry = new MockHttp(receipts(3));
+		await run(items, firstTry, false, { executionId: '1001', runIndex: 0 });
+		const secondTry = new MockHttp(receipts(3));
+		await run(items, secondTry, false, { executionId: '1001', runIndex: 0 });
+		assert.deepEqual(keys(secondTry), keys(firstTry));
+		assert.strictEqual(new Set(keys(firstTry)).size, 3);
+	});
+
+	it('gives a new key to another execution, another run of the node, another node and another workflow', async () => {
+		const keyFor = async (position: ExecutionPosition) => {
+			const http = new MockHttp(receipts(1));
+			await run([sendParams()], http, false, position);
+			return keys(http)[0];
+		};
+		const base = await keyFor({ executionId: '1001', runIndex: 0 });
+		const others = await Promise.all([
+			keyFor({ executionId: '1002', runIndex: 0 }), // a manual retry is a new execution
+			keyFor({ executionId: '1001', runIndex: 1 }), // a loop, or an AI Agent tool call
+			keyFor({ executionId: '1001', runIndex: 0, nodeName: 'Sendly1' }),
+			keyFor({ executionId: '1001', runIndex: 0, workflowId: 'wf-2' }),
+			keyFor({ executionId: '1001', runIndex: 0, instanceId: 'instance-b' }),
+		]);
+		assert.strictEqual(new Set([base, ...others]).size, 6);
+	});
+
+	it('falls back to a random key when n8n gives no execution ID', async () => {
+		const http = new MockHttp(receipts(2));
+		await run([sendParams()], http, false, { executionId: null });
+		await run([sendParams()], http, false, { executionId: null });
+		const [first, second] = keys(http);
 		assert.match(first, /^n8n-[0-9a-f-]{36}$/);
-		assert.match(second, /^n8n-[0-9a-f-]{36}$/);
 		assert.notStrictEqual(first, second);
 	});
 
@@ -117,6 +169,45 @@ describe('Email > Send', () => {
 		]);
 		await run([sendParams()], http);
 		assert.strictEqual(http.calls.length, 2);
+	});
+
+	it('surfaces an error, after exactly one retry, when both attempts answer 5xx or 409', async () => {
+		for (const [first, second] of [
+			[503, 503],
+			[409, 409],
+			[409, 502],
+		]) {
+			const http = new MockHttp([
+				{ statusCode: first, body: { code: 'unavailable', detail: `First ${first}` } },
+				{ statusCode: second, body: { code: 'unavailable', detail: `Second ${second}` } },
+			]);
+			const error = await rejection(run([sendParams()], http));
+			assert.strictEqual(http.calls.length, 2);
+			assert.strictEqual(error.constructor.name, 'NodeApiError');
+			assert.match(error.message, new RegExp(`Sendly did not send the email: Second ${second}`));
+			assert.strictEqual(error.httpCode, String(second));
+		}
+	});
+
+	it('retries once with the same key when the request gets no answer (network error mid-send)', async () => {
+		const http = new MockHttp([
+			{ statusCode: 0, networkError: 'socket hang up' },
+			{ statusCode: 202, body: RECEIPT },
+		]);
+		const [[item]] = await run([sendParams()], http);
+		assert.deepEqual(item.json, RECEIPT);
+		assert.strictEqual(http.calls.length, 2);
+		assert.strictEqual(keys(http)[0], keys(http)[1]);
+	});
+
+	it('reports the network error when the retry gets no answer either', async () => {
+		const http = new MockHttp([
+			{ statusCode: 0, networkError: 'socket hang up' },
+			{ statusCode: 0, networkError: 'second attempt reset' },
+		]);
+		const error = await rejection(run([sendParams()], http));
+		assert.strictEqual(http.calls.length, 2);
+		assert.match(error.message, /second attempt reset/);
 	});
 
 	it("does not retry a validation error, and reports Sendly's own message and field errors", async () => {

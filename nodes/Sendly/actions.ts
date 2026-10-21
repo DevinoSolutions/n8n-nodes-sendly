@@ -5,7 +5,12 @@ import {
 	type Contact,
 	type CursorPage,
 } from './shared/contacts';
-import { derivedIdempotencyKey, sendIdempotencyKey, sendWithOneRetry } from './shared/idempotency';
+import {
+	derivedIdempotencyKey,
+	sendIdempotencyKey,
+	sendWithOneRetry,
+	type SendPosition,
+} from './shared/idempotency';
 import { sendlyApiRequest, sendlyRequest, throwApiError } from './shared/transport';
 import { parseJsonObject, toIsoOrNull, toStringList } from './shared/utils';
 
@@ -73,15 +78,36 @@ export function buildSendBody(this: IExecuteFunctions, itemIndex: number): IData
 	return body;
 }
 
+/** Reads an optional piece of n8n context; a runtime that lacks it yields `undefined`. */
+function optional<T>(read: () => T): T | undefined {
+	try {
+		return read();
+	} catch {
+		return undefined;
+	}
+}
+
+/** Where this item's send sits in the execution; see `sendIdempotencyKey`. */
+function sendPosition(this: IExecuteFunctions, itemIndex: number): SendPosition {
+	return {
+		instanceId: optional(() => this.getInstanceId()),
+		workflowId: optional(() => this.getWorkflow().id),
+		executionId: optional(() => this.getExecutionId()),
+		nodeName: this.getNode().name,
+		runIndex: optional(() => this.getWorkflowDataProxy(itemIndex).$thisRunIndex) ?? 0,
+		itemIndex,
+	};
+}
+
 /**
- * POST /api/v1/emails with an `Idempotency-Key`, retried once with the same key on a 5xx or a
- * 409. The receipt's `status` is usually PENDING: the email is queued, and its delivery, opens
- * and clicks arrive later through the Sendly Trigger.
+ * POST /api/v1/emails with an `Idempotency-Key`, retried once with the same key on a 5xx, a 409
+ * or a request that got no answer. The receipt's `status` is usually PENDING: the email is
+ * queued, and its delivery, opens and clicks arrive later through the Sendly Trigger.
  */
 const sendEmail: Handler = async function (itemIndex) {
 	const body = buildSendBody.call(this, itemIndex);
 	const fields = this.getNodeParameter('additionalFields', itemIndex, {}) as IDataObject;
-	const key = sendIdempotencyKey(fields.idempotencyKey);
+	const key = sendIdempotencyKey(fields.idempotencyKey, sendPosition.call(this, itemIndex));
 	const response = await sendWithOneRetry(
 		async () =>
 			await sendlyRequest.call(this, {

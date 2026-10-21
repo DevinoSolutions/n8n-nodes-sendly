@@ -28,8 +28,16 @@ function delivery(event: string, data: IDataObject, timestamp = '1792500000000')
 	return JSON.stringify({ event, data, timestamp });
 }
 
-function signedHeaders(body: string, secret = SECRET, id = 'msg_1'): IDataObject {
-	const timestamp = '1792500000';
+function nowSeconds(): string {
+	return String(Math.floor(Date.now() / 1000));
+}
+
+function signedHeaders(
+	body: string,
+	secret = SECRET,
+	id = 'msg_1',
+	timestamp = nowSeconds(),
+): IDataObject {
 	return {
 		'content-type': 'application/json',
 		'webhook-id': id,
@@ -45,8 +53,9 @@ async function receive(options: {
 	staticData?: IDataObject;
 	http?: MockHttp;
 	includeDetails?: boolean;
+	recorder?: WebhookResponseRecorder;
 }) {
-	const recorder: WebhookResponseRecorder = {};
+	const recorder: WebhookResponseRecorder = options.recorder ?? {};
 	const http = options.http ?? new MockHttp();
 	const result = await trigger.webhook.call(
 		webhookContext({
@@ -182,6 +191,64 @@ describe('Sendly Trigger > webhook lifecycle', () => {
 		}
 	});
 
+	it('checkExists deletes the old webhook when its URL is not this node URL, then reports it missing', async () => {
+		const http = new MockHttp([
+			{
+				statusCode: 200,
+				body: {
+					id: WEBHOOK_ID,
+					url: 'https://old-host.example.com/webhook/abc-123/webhook',
+					event_types: ['email.opened'],
+					status: 'ACTIVE',
+				},
+			},
+			{ statusCode: 200, body: { id: WEBHOOK_ID, deleted: true } },
+		]);
+		const staticData: IDataObject = { webhookId: WEBHOOK_ID, webhookSecret: SECRET };
+		const exists = await hooks.checkExists.call(
+			hookContext({ events: ['email.opened'] }, staticData, http),
+		);
+		assert.strictEqual(exists, false);
+		assert.strictEqual(http.calls.length, 2);
+		assert.strictEqual(http.calls[1].method, 'DELETE');
+		assert.strictEqual(http.calls[1].url, `https://api.sendly.now/api/v1/webhooks/${WEBHOOK_ID}`);
+		assert.deepEqual(staticData, {});
+	});
+
+	it('checkExists fails the activation, keeping the record, when the outdated webhook cannot be deleted', async () => {
+		const http = new MockHttp([
+			{
+				statusCode: 200,
+				body: { id: WEBHOOK_ID, url: 'https://old-host.example.com/x', status: 'ACTIVE' },
+			},
+			{ statusCode: 500, body: { detail: 'Internal error' } },
+		]);
+		const staticData: IDataObject = { webhookId: WEBHOOK_ID, webhookSecret: SECRET };
+		const error = await rejection(
+			hooks.checkExists.call(hookContext({ events: ['email.opened'] }, staticData, http)),
+		);
+		assert.match(error.message, /Could not remove the outdated Sendly webhook/);
+		assert.strictEqual(staticData.webhookId, WEBHOOK_ID);
+	});
+
+	it('create deletes a webhook registered without a signing secret and fails the activation', async () => {
+		const staticData: IDataObject = {};
+		const http = new MockHttp([
+			{
+				statusCode: 201,
+				body: { webhook: { id: WEBHOOK_ID, url: WEBHOOK_URL, status: 'ACTIVE' } },
+			},
+			{ statusCode: 200, body: { id: WEBHOOK_ID, deleted: true } },
+		]);
+		const error = await rejection(
+			hooks.create.call(hookContext({ events: ['email.opened'] }, staticData, http)),
+		);
+		assert.match(error.message, /without returning its signing secret/);
+		assert.strictEqual(http.calls[1].method, 'DELETE');
+		assert.strictEqual(http.calls[1].url, `https://api.sendly.now/api/v1/webhooks/${WEBHOOK_ID}`);
+		assert.deepEqual(staticData, {});
+	});
+
 	it('delete removes the webhook and forgets it; a 404 counts as removed', async () => {
 		for (const statusCode of [200, 404]) {
 			const http = new MockHttp([{ statusCode, body: {} }]);
@@ -219,13 +286,23 @@ describe('Sendly Trigger > deliveries', () => {
 				},
 			},
 		]);
-		const { result, recorder } = await receive({
+		const recorder: WebhookResponseRecorder = {};
+		let answeredBeforeReadBack: number | undefined;
+		const handle = http.handle.bind(http);
+		http.handle = async (credentialName, options) => {
+			answeredBeforeReadBack = recorder.statusCode;
+			return await handle(credentialName, options);
+		};
+		const { result } = await receive({
 			body,
 			headers: signedHeaders(body),
 			events: ['email.opened'],
 			http,
+			recorder,
 		});
-		assert.strictEqual(recorder.statusCode, undefined);
+		// The 200 goes out before the read-back, and n8n is told not to answer again.
+		assert.strictEqual(answeredBeforeReadBack, 200);
+		assert.strictEqual(result.noWebhookResponse, true);
 		assert.strictEqual(http.calls[0].url, 'https://api.sendly.now/api/emails/e-1');
 		const [[item]] = result.workflowData ?? [];
 		assert.deepEqual(item.json, {
@@ -351,7 +428,7 @@ describe('Sendly Trigger > deliveries', () => {
 		const body = delivery('email.sent', { emailId: 'e-1' });
 		const headers = signedHeaders(body, legacySecret);
 		headers['webhook-signature'] =
-			`${sign(SECRET.replace(/.$/, 'A'), 'msg_1', '1792500000', body)} ${String(headers['webhook-signature'])}`;
+			`${sign(SECRET.replace(/.$/, 'A'), 'msg_1', String(headers['webhook-timestamp']), body)} ${String(headers['webhook-signature'])}`;
 		const { result, recorder } = await receive({
 			body,
 			headers,
@@ -371,5 +448,111 @@ describe('Sendly Trigger > deliveries', () => {
 			events: ['email.opened'],
 		});
 		assert.deepEqual(result, {});
+	});
+
+	it('refuses a correctly signed delivery whose timestamp is more than five minutes off (a replay)', async () => {
+		const body = delivery('email.opened', { emailId: 'e-1' });
+		const now = Math.floor(Date.now() / 1000);
+		for (const skew of [-301, 301, -3600]) {
+			const { result, recorder, http } = await receive({
+				body,
+				headers: signedHeaders(body, SECRET, 'msg_old', String(now + skew)),
+				events: ['email.opened'],
+			});
+			assert.deepEqual(result, { noWebhookResponse: true });
+			assert.strictEqual(recorder.statusCode, 401);
+			assert.deepEqual(recorder.body, { error: 'Stale Sendly webhook timestamp' });
+			assert.strictEqual(http.calls.length, 0);
+		}
+		// Inside the window, either way, is accepted.
+		for (const skew of [-290, 290]) {
+			const { result } = await receive({
+				body,
+				headers: signedHeaders(body, SECRET, 'msg_ok', String(now + skew)),
+				events: ['email.opened'],
+				includeDetails: false,
+			});
+			assert.strictEqual(result.workflowData?.[0].length, 1);
+		}
+	});
+
+	it('starts the workflow once per webhook-id: a redelivery of the same event is answered and ignored', async () => {
+		const staticData: IDataObject = { webhookId: WEBHOOK_ID, webhookSecret: SECRET };
+		const body = delivery('email.opened', { emailId: 'e-1' });
+		const http = new MockHttp([{ statusCode: 200, body: { success: true, data: { id: 'e-1' } } }]);
+		const first = await receive({
+			body,
+			headers: signedHeaders(body, SECRET, 'msg_dup'),
+			events: ['email.opened'],
+			staticData,
+			http,
+		});
+		assert.strictEqual(first.result.workflowData?.[0].length, 1);
+
+		// Sendly's retry: same id, signed again later.
+		const retry = await receive({
+			body,
+			headers: signedHeaders(body, SECRET, 'msg_dup', String(Math.floor(Date.now() / 1000) + 30)),
+			events: ['email.opened'],
+			staticData,
+			http,
+		});
+		assert.strictEqual(retry.result.workflowData, undefined);
+		assert.deepEqual(retry.result.webhookResponse, { received: true, duplicate: true });
+		assert.strictEqual(http.calls.length, 1, 'no second read-back');
+
+		const other = await receive({
+			body,
+			headers: signedHeaders(body, SECRET, 'msg_next'),
+			events: ['email.opened'],
+			staticData,
+			includeDetails: false,
+		});
+		assert.strictEqual(other.result.workflowData?.[0].length, 1);
+	});
+
+	it('remembers only the last 200 delivery ids', async () => {
+		const staticData: IDataObject = {
+			webhookId: WEBHOOK_ID,
+			webhookSecret: SECRET,
+			deliveryIds: Array.from({ length: 200 }, (_, index) => `msg_${index}`),
+		};
+		const body = delivery('email.sent', { emailId: 'e-1' });
+		await receive({
+			body,
+			headers: signedHeaders(body, SECRET, 'msg_200'),
+			events: ['email.sent'],
+			staticData,
+			includeDetails: false,
+		});
+		const ids = staticData.deliveryIds as string[];
+		assert.strictEqual(ids.length, 200);
+		assert.strictEqual(ids[0], 'msg_1');
+		assert.strictEqual(ids[199], 'msg_200');
+	});
+
+	it('does not record a refused delivery, so a forged copy cannot block the real event', async () => {
+		const staticData: IDataObject = { webhookId: WEBHOOK_ID, webhookSecret: SECRET };
+		const body = delivery('email.sent', { emailId: 'e-1' });
+		await receive({
+			body,
+			headers: signedHeaders(body, `whsec_${Buffer.from('another-key').toString('base64')}`, 'msg_x'),
+			events: ['email.sent'],
+			staticData,
+		});
+		assert.strictEqual(staticData.deliveryIds, undefined);
+	});
+
+	it('still emits the event when the read-back request itself fails, since the 200 is already sent', async () => {
+		const body = delivery('contact.created', { contactId: 'c-1' });
+		const http = new MockHttp([{ statusCode: 0, networkError: 'ECONNRESET' }]);
+		const { result, recorder } = await receive({
+			body,
+			headers: signedHeaders(body),
+			events: ['contact.created'],
+			http,
+		});
+		assert.strictEqual(recorder.statusCode, 200);
+		assert.strictEqual(result.workflowData?.[0][0].json.contact, null);
 	});
 });

@@ -1,5 +1,6 @@
 import {
 	NodeConnectionTypes,
+	NodeOperationError,
 	type IDataObject,
 	type IHookFunctions,
 	type INodeType,
@@ -9,7 +10,7 @@ import {
 } from 'n8n-workflow';
 import { sendlyRequest, throwApiError } from '../Sendly/shared/transport';
 import { toIsoOrNull } from '../Sendly/shared/utils';
-import { readHeader, signatureMatches } from './signature';
+import { readHeader, signatureMatches, timestampIsFresh } from './signature';
 
 /** The event types Sendly's POST /api/v1/webhooks accepts that this trigger offers. */
 export const EVENT_OPTIONS = [
@@ -61,10 +62,25 @@ export const EVENT_OPTIONS = [
 	},
 ];
 
+/**
+ * What the node keeps in the workflow's static data: the Sendly webhook it registered, the
+ * signing secret Sendly shows once when the webhook is created (n8n's own trigger nodes keep
+ * their webhook IDs and secrets the same way), and the IDs of the last deliveries it accepted.
+ *
+ * n8n keeps this per mode. A production activation reads and writes the workflow's saved static
+ * data. "Listen for test event" starts from empty static data that n8n holds with the test
+ * registration only (TestWebhooks.toWorkflow / setTestStaticData), so a test listen on an
+ * active workflow registers its own webhook for the test URL and never sees, replaces or
+ * deletes the production webhook's ID or secret.
+ */
 interface WebhookState extends IDataObject {
 	webhookId?: string;
 	webhookSecret?: string;
+	deliveryIds?: string[];
 }
+
+/** How many accepted delivery IDs are remembered to drop Sendly's retries of the same event. */
+export const REMEMBERED_DELIVERIES = 200;
 
 interface Envelope {
 	event?: string;
@@ -83,6 +99,27 @@ function sameEvents(left: string[], right: string[]): boolean {
 	const a = [...new Set(left)].sort();
 	const b = [...new Set(right)].sort();
 	return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+/** DELETE a registered webhook; a 404 means it is already gone, which is the goal. */
+async function removeWebhook(this: IHookFunctions, webhookId: string): Promise<void> {
+	const response = await sendlyRequest.call(this, {
+		method: 'DELETE',
+		path: `/api/v1/webhooks/${encodeURIComponent(webhookId)}`,
+	});
+	if (response.statusCode >= 400 && response.statusCode !== 404) {
+		throwApiError.call(this, response, 'Could not remove the outdated Sendly webhook:');
+	}
+}
+
+/** Reads an email or contact back from Sendly; any failure leaves the detail empty. */
+async function readBack(this: IWebhookFunctions, path: string): Promise<IDataObject | null> {
+	try {
+		const response = await sendlyRequest.call(this, { method: 'GET', path });
+		return response.statusCode < 400 ? (response.body as IDataObject) : null;
+	} catch {
+		return null;
+	}
 }
 
 export class SendlyTrigger implements INodeType {
@@ -163,17 +200,18 @@ export class SendlyTrigger implements INodeType {
 				}
 
 				const webhook = response.body as WebhookRecord;
-				if (webhook.url !== this.getNodeWebhookUrl('default')) return false;
-
 				const events = this.getNodeParameter('events', []) as string[];
-				if (webhook.status === 'ACTIVE' && sameEvents(webhook.event_types ?? [], events)) {
+				if (
+					webhook.url === this.getNodeWebhookUrl('default') &&
+					webhook.status === 'ACTIVE' &&
+					sameEvents(webhook.event_types ?? [], events)
+				) {
 					return true;
 				}
-				// Same URL but other events, or paused/disabled after repeated failures: replace it.
-				await sendlyRequest.call(this, {
-					method: 'DELETE',
-					path: `/api/v1/webhooks/${encodeURIComponent(state.webhookId)}`,
-				});
+				// Another URL (n8n's base URL changed), other events, or paused/disabled after
+				// repeated failures: remove it before `create` registers the replacement, so the old
+				// one stops posting this project's events to a URL nobody verifies.
+				await removeWebhook.call(this, state.webhookId);
 				delete state.webhookId;
 				delete state.webhookSecret;
 				return false;
@@ -194,7 +232,17 @@ export class SendlyTrigger implements INodeType {
 					);
 				}
 				const created = response.body as { webhook?: { id?: string }; secret?: string };
-				if (!created.webhook?.id || !created.secret) return false;
+				if (!created.webhook?.id || !created.secret) {
+					// Without the secret no delivery can be verified, so a webhook kept now would only
+					// post requests this node refuses. Remove it, and fail the activation loudly: n8n
+					// ignores what `create` returns, so `false` would leave a dead trigger "active".
+					if (created.webhook?.id) await removeWebhook.call(this, created.webhook.id);
+					throw new NodeOperationError(
+						this.getNode(),
+						'Sendly registered the webhook without returning its signing secret',
+						{ description: 'The webhook was removed again. Activate the workflow again.' },
+					);
+				}
 
 				// The signing secret is shown once, by this response only; it is kept to verify
 				// every delivery.
@@ -249,10 +297,17 @@ export class SendlyTrigger implements INodeType {
 				signatureHeader: signature,
 			});
 
-		if (!verified) {
-			// A forged or stale request: refuse it without starting the workflow.
-			const response = this.getResponseObject();
-			response.status(401).json({ error: 'Invalid Sendly webhook signature' });
+		if (!verified || !id || !timestamp) {
+			// A forged request: refuse it without starting the workflow.
+			this.getResponseObject().status(401).json({ error: 'Invalid Sendly webhook signature' });
+			return { noWebhookResponse: true };
+		}
+		// Sendly signs every attempt, its retries included, with the time of that attempt
+		// (WebhookSigning.buildSignatureHeaders is called with `now` on each try), so a genuine
+		// delivery is never older than its trip over the network. One signed more than five
+		// minutes away from now is a captured request played back.
+		if (!timestampIsFresh(timestamp)) {
+			this.getResponseObject().status(401).json({ error: 'Stale Sendly webhook timestamp' });
 			return { noWebhookResponse: true };
 		}
 
@@ -261,6 +316,17 @@ export class SendlyTrigger implements INodeType {
 		if (!envelope.event || !events.includes(envelope.event)) {
 			return {};
 		}
+
+		// Sendly re-sends an event until it gets a 2xx, with the same `webhook-id` each time. One
+		// already accepted is answered 200 and starts nothing. The list is replaced rather than
+		// pushed to, so n8n sees the change and saves it. Two copies arriving at the same instant
+		// can both pass (each request reads the saved list), which Sendly's retry spacing (30
+		// seconds and up) makes rare.
+		const seen = Array.isArray(state.deliveryIds) ? state.deliveryIds : [];
+		if (seen.includes(id)) {
+			return { webhookResponse: { received: true, duplicate: true } };
+		}
+		state.deliveryIds = [...seen, id].slice(-REMEMBERED_DELIVERIES);
 
 		const data = (envelope.data ?? {}) as IDataObject;
 		const isTest = data.test === true;
@@ -274,25 +340,38 @@ export class SendlyTrigger implements INodeType {
 		};
 
 		const options = this.getNodeParameter('options', {}) as IDataObject;
-		if (options.includeDetails !== false && !isTest) {
-			if (envelope.event.startsWith('email.') && typeof data.emailId === 'string') {
-				const email = await sendlyRequest.call(this, {
-					method: 'GET',
-					path: `/api/emails/${encodeURIComponent(data.emailId)}`,
-				});
-				output.email =
-					email.statusCode < 400
-						? (((email.body as IDataObject).data as IDataObject) ?? null)
-						: null;
-			} else if (envelope.event.startsWith('contact.') && typeof data.contactId === 'string') {
-				const contact = await sendlyRequest.call(this, {
-					method: 'GET',
-					path: `/api/v1/contacts/${encodeURIComponent(data.contactId)}`,
-				});
-				output.contact = contact.statusCode < 400 ? (contact.body as IDataObject) : null;
-			}
+		const emailId =
+			envelope.event.startsWith('email.') && typeof data.emailId === 'string'
+				? data.emailId
+				: undefined;
+		const contactId =
+			envelope.event.startsWith('contact.') && typeof data.contactId === 'string'
+				? data.contactId
+				: undefined;
+		if (options.includeDetails === false || isTest || (!emailId && !contactId)) {
+			return { workflowData: [this.helpers.returnJsonArray([output])] };
 		}
 
-		return { workflowData: [this.helpers.returnJsonArray([output])] };
+		// The read-back is one more API call. In the "onReceived" response mode n8n answers only
+		// after this method returns, and Sendly abandons an attempt after 10 seconds and retries
+		// it, so the node sends the 200 itself first; `noWebhookResponse` then stops n8n from
+		// answering a second time. The delivery ID is recorded above, so a retry that still raced
+		// this answer would start nothing. Read-back failures leave the detail empty and never
+		// throw, because the answer is already sent.
+		this.getResponseObject().status(200).json({ received: true });
+		if (emailId) {
+			const email = await readBack.call(this, `/api/emails/${encodeURIComponent(emailId)}`);
+			output.email = (email?.data as IDataObject | undefined) ?? null;
+		} else if (contactId) {
+			output.contact = await readBack.call(
+				this,
+				`/api/v1/contacts/${encodeURIComponent(contactId)}`,
+			);
+		}
+
+		return {
+			noWebhookResponse: true,
+			workflowData: [this.helpers.returnJsonArray([output])],
+		};
 	}
 }

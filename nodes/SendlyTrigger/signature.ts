@@ -48,6 +48,19 @@ export function signatureMatches(options: {
 		});
 }
 
+/** How far a delivery's signed `webhook-timestamp` may be from now, either way (seconds). */
+export const TIMESTAMP_TOLERANCE_SECONDS = 5 * 60;
+
+/**
+ * Whether a signed `webhook-timestamp` (unix seconds) is within the tolerance of `nowMs`. The
+ * Standard Webhooks replay guard: the timestamp is part of what is signed, so an attacker who
+ * captured a delivery cannot move it forward.
+ */
+export function timestampIsFresh(timestamp: string, nowMs: number = Date.now()): boolean {
+	if (!/^\d{1,12}$/.test(timestamp)) return false;
+	return Math.abs(nowMs / 1000 - Number(timestamp)) <= TIMESTAMP_TOLERANCE_SECONDS;
+}
+
 /** Header lookup that ignores case, for any header map n8n hands over. */
 export function readHeader(
 	headers: Record<string, string | string[] | undefined> | undefined,

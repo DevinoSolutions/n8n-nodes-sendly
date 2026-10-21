@@ -111,7 +111,7 @@ export const emailFields: INodeProperties[] = [
 				default: '',
 				placeholder: 'e.g. {{ $json.orderId }}',
 				description:
-					'Map something unique to this send, such as an order ID. Sendly will not send the same key twice within 24 hours, even if the workflow is re-run. Leave empty and every execution sends.',
+					'Map something unique to this send, such as an order ID. Sendly will not send the same key twice within 24 hours, even if the execution is retried or the workflow re-runs, and it refuses the key for a different email. Left empty, Retry On Fail does not resend items already sent, but a manual retry of a failed execution does.',
 			},
 			{
 				displayName: 'From Email',

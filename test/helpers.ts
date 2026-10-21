@@ -22,6 +22,8 @@ export interface MockResponse {
 	statusCode: number;
 	body?: unknown;
 	headers?: IDataObject;
+	/** Throw this instead of answering, as a reset connection or a timeout does. */
+	networkError?: string;
 }
 
 export interface RecordedCall {
@@ -68,6 +70,7 @@ export class MockHttp {
 		if (!options.returnFullResponse || !options.ignoreHttpStatusErrors) {
 			throw new Error('The node must ask for the full response and handle error statuses itself');
 		}
+		if (next.networkError) throw new Error(next.networkError);
 		return { statusCode: next.statusCode, body: next.body ?? {}, headers: next.headers ?? {} };
 	}
 }
@@ -130,13 +133,28 @@ const helpers = {
 	},
 };
 
+export interface ExecutionPosition {
+	/** `null` stands for a runtime that gives no execution ID. */
+	executionId?: string | null;
+	runIndex?: number;
+	nodeName?: string;
+	workflowId?: string;
+	instanceId?: string;
+}
+
 export function executeContext(
 	itemParameters: IDataObject[],
 	http: MockHttp,
-	options: { continueOnFail?: boolean } = {},
+	options: { continueOnFail?: boolean; position?: ExecutionPosition } = {},
 ): IExecuteFunctions {
+	const position = options.position ?? {};
+	const executionId = position.executionId === undefined ? '1001' : position.executionId;
 	return {
 		getInputData: () => itemParameters.map(() => ({ json: {} })),
+		getExecutionId: () => executionId ?? undefined,
+		getInstanceId: () => position.instanceId ?? 'instance-a',
+		getWorkflow: () => ({ id: position.workflowId ?? 'wf-1', name: 'Test', active: false }),
+		getWorkflowDataProxy: () => ({ $thisRunIndex: position.runIndex ?? 0 }),
 		// A plain function, so `arguments.length` tells "no fallback given" from "fallback undefined".
 		getNodeParameter: function (
 			name: string,
@@ -152,7 +170,7 @@ export function executeContext(
 				arguments.length > 2,
 			);
 		},
-		getNode: () => NODE,
+		getNode: () => (position.nodeName ? { ...NODE, name: position.nodeName } : NODE),
 		continueOnFail: () => options.continueOnFail ?? false,
 		helpers: {
 			...helpers,

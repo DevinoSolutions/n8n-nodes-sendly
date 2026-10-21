@@ -53,7 +53,16 @@ n8n checks the credential with `GET https://api.sendly.now/api/v1/projects`, whi
 | --- | --- | --- |
 | Send | Send one email to one recipient, from a Sendly template or from a subject and HTML body. Optional: recipient name, sender and sender name, reply-to, CC, BCC, tags, template variables and a deduplication key. | `POST /api/v1/emails` |
 
-Every send carries an `Idempotency-Key` header. Without a **Deduplication Key** each execution gets a fresh key, and the node retries once with the same key after a 5xx or a 409, so a retry never sends twice. Map something unique to the send (an order ID, say) into **Deduplication Key** and Sendly will not send it again for 24 hours, even if the workflow re-runs the same item.
+Every send carries an `Idempotency-Key` header, and Sendly answers a repeated key with the first send's receipt for 24 hours instead of sending again. What that protects depends on the key:
+
+- **Without a Deduplication Key** the key is derived from where the send sits in n8n: the instance, workflow, execution, node, run of the node and input item.
+  - The node's own retry (once, with the same key, after a 5xx, a 409 or a request that got no answer) never sends twice.
+  - n8n's **Retry On Fail** re-runs the whole node, every item included, inside the same execution, so items already sent get their first receipt back instead of a second email.
+  - A loop, or an AI Agent calling the node again, is a new run of the node and sends again, as intended.
+  - A manual **Retry** of a failed execution (from the executions list), or running the workflow again, is a new execution with a new ID. Items that were sent before the failure **are sent again**. Only a Deduplication Key prevents that.
+- **With a Deduplication Key** (an order ID, say) the key is the same in every execution, so Sendly will not send it again for 24 hours, whatever re-runs the item. The key names the email, not its content: a second send under the same key with a different body (another recipient, other variables) is refused with an error and not sent. Map something unique to each email, not to the customer.
+
+If the body itself changes between tries of the same item (for example it maps `$now`), Sendly also refuses the reused derived key rather than send a second, different email.
 
 The answer is the send receipt: the email ID, the sender actually used, and a status that is usually `PENDING`. Delivery, opens and clicks arrive later through the **Sendly Trigger**.
 
@@ -61,7 +70,7 @@ The answer is the send receipt: the email ID, the sender actually used, and a st
 
 | Operation | What it does | Sendly API |
 | --- | --- | --- |
-| Create or Update | Create a contact, or update the existing contact with the same email address. Custom fields are merged with the stored ones unless **Replace Custom Fields** is on. The subscription is changed only when you set **Subscribed**, so a workflow never re-subscribes someone by accident. The output has `created: true` or `false`. | `POST /api/v1/contacts`, then on 409 `GET /api/v1/contacts?search=` and `PATCH /api/v1/contacts/{id}` |
+| Create or Update | Create a contact, or update the existing contact with the same email address. Custom fields are merged with the stored ones unless **Replace Custom Fields** is on. The subscription is changed only when you set **Subscribed**, so a workflow never re-subscribes someone by accident. The output has `created: true` or `false`. Merging is a read, then a write: two runs updating the same email address at the same moment can each read the old fields, and the later write drops the other's change. Send updates for one contact through one run at a time when that matters. | `POST /api/v1/contacts`, then on 409 `GET /api/v1/contacts?search=` and `PATCH /api/v1/contacts/{id}` |
 | Find by Email | Find the contact with an exact email address (letter case is ignored). No match returns no item. | `GET /api/v1/contacts?search=` |
 | Get | Retrieve a contact by ID. | `GET /api/v1/contacts/{id}` |
 | Get Many | List contacts, newest first, filtered by "email contains" and subscription, with Return All or a limit. | `GET /api/v1/contacts` |
@@ -78,7 +87,7 @@ The answer is the send receipt: the email ID, the sender actually used, and a st
 
 | Operation | What it does | Sendly API |
 | --- | --- | --- |
-| Send | Send a draft or scheduled campaign to its whole audience, now or at a future **Send At**. The campaign's content and audience are set in Sendly. Each campaign sends once, and the `Idempotency-Key` is derived from the campaign and the time, so a re-run never sends twice. | `POST /api/v1/campaigns/{id}/send` |
+| Send | Send a draft or scheduled campaign to its whole audience, now or at a future **Send At**. The campaign's content and audience are set in Sendly. Each campaign sends once: Sendly refuses to send a campaign that is no longer a draft or scheduled, so a re-run, a retry or a manual retry of the execution never sends it twice. The `Idempotency-Key` is derived from the campaign and **Send At**, so a retry that races the first request gets its answer instead of an error. | `POST /api/v1/campaigns/{id}/send` |
 
 **Template**, **List** and **Campaign** are dropdowns loaded from your project (the Campaign dropdown shows only draft and scheduled campaigns). You can also switch them to **By ID**.
 
@@ -98,11 +107,15 @@ The answer is the send receipt: the email ID, the sender actually used, and a st
 | Contact Created | A contact is added one at a time (contacts created in one bulk request do not fire it) |
 | Contact Unsubscribed | A contact unsubscribes |
 
-- **Signatures are verified.** Sendly signs every delivery with Standard Webhooks headers (`webhook-id`, `webhook-timestamp`, `webhook-signature`, HMAC-SHA256). The node keeps the signing secret Sendly returns when the webhook is created and answers `401` to any request whose signature does not match, without starting the workflow. Both signatures sent during a secret rotation are accepted.
+- **Signatures are verified.** Sendly signs every delivery with Standard Webhooks headers (`webhook-id`, `webhook-timestamp`, `webhook-signature`, HMAC-SHA256). The node answers `401` to any request whose signature does not match, without starting the workflow. Both signatures sent during a secret rotation are accepted.
+- **Replays are refused.** Sendly signs each attempt, retries included, with the time of that attempt, so the node also answers `401` to a delivery whose signed timestamp is more than 5 minutes from the n8n server's clock. Keep that clock synchronised (NTP).
+- **Each event starts the workflow once.** Sendly retries a delivery until it gets a `2xx`, with the same `webhook-id`. The node remembers the last 200 delivery IDs and answers a repeat with `200` without starting the workflow.
+- **Where the secret lives.** Sendly shows the signing secret once, when the webhook is created. The node keeps it, with the webhook ID and the recent delivery IDs, in the workflow's static data, which n8n stores with the workflow in its database, as it does for its own trigger nodes. Anyone who can read the workflow's database row can read the secret. **Listen for test event** registers a separate webhook for the test URL, with its own secret that n8n holds only for the test session, so it never touches an active workflow's webhook.
 - **Each item** has `event`, `event_id` (the delivery's `webhook-id`, stable across Sendly's retries), `occurred_at`, `test`, and the raw event `data`.
-- **Include Details** (on by default) reads the email (`GET /api/emails/{id}`) or the contact (`GET /api/v1/contacts/{id}`) back from Sendly, so the item carries the recipient, subject, status and counts, or the custom fields. Turn it off to save that API read.
+- **Include Details** (on by default) reads the email (`GET /api/emails/{id}`) or the contact (`GET /api/v1/contacts/{id}`) back from Sendly, so the item carries the recipient, subject, status and counts, or the custom fields. The node answers Sendly's request before that read, so the read never delays the answer. If the read fails, the item is still emitted with the detail set to `null`. Turn it off to save that API read.
 - A dashboard **Send test** delivery is passed through with `test: true` and no details.
 - If you rotate the webhook's secret in Sendly, deactivate and re-activate the workflow so the node registers a fresh webhook.
+- On activation the node replaces a webhook it registered earlier if its URL (n8n's base URL changed), its events or its status (Sendly disabled it after repeated failures) no longer match, deleting the old one in Sendly first.
 
 ## Usage examples
 
