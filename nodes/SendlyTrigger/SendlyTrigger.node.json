@@ -1,0 +1,18 @@
+{
+	"node": "n8n-nodes-sendly.sendlyTrigger",
+	"nodeVersion": "1.0",
+	"codexVersion": "1.0",
+	"categories": ["Communication", "Marketing & Content"],
+	"resources": {
+		"credentialDocumentation": [
+			{
+				"url": "https://github.com/DevinoSolutions/n8n-nodes-sendly?tab=readme-ov-file#credentials"
+			}
+		],
+		"primaryDocumentation": [
+			{
+				"url": "https://github.com/DevinoSolutions/n8n-nodes-sendly?tab=readme-ov-file#trigger"
+			}
+		]
+	}
+}
