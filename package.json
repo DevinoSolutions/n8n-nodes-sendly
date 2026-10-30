@@ -3,7 +3,7 @@
 	"version": "0.1.0",
 	"description": "n8n community node for Sendly: send transactional emails and campaigns, add or update contacts and list members, and start workflows on email and contact events.",
 	"license": "MIT",
-	"homepage": "https://sendly.now",
+	"homepage": "https://github.com/DevinoSolutions/n8n-nodes-sendly#readme",
 	"keywords": [
 		"n8n-community-node-package",
 		"n8n",
